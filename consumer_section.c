@@ -15,11 +15,6 @@ struct ring_section {
     int wrap;
 };
 
-/*
- * Taken from https://stackoverflow.com/questions/7775991/how-to-get-hexdump-of-a-structure-data
- * Use print_hex_dump in the kernel
- */
-void hex_dump (const char * desc, const void * addr, const int len);
 
 /**
  * xaprc00x_ring_section - Gives the caller parameters to consume data from a
@@ -89,10 +84,8 @@ void ring_produce(
         int ring_len,
         struct ring_section section)
 {
-    printf("%s oldhead=%d start=%d, len=%d, wrap=%d ", __func__, ring->head, section.start, section.len, section.wrap);
     int newhead =
             (section.start + section.len + section.wrap) & (ring_len - 1);
-    printf("newhead=%d\n", newhead);
     WRITE_ONCE(ring->head, newhead);
 }
 
@@ -132,6 +125,8 @@ int main(int argc, char **argv) {
     struct circ_buf ring = {0};
     struct packet *pkt;
     struct ring_section section;
+    typedef const char * err_msg_t;
+    err_msg_t *error_msg = NULL;
 
     ring.buf = malloc(ring_len);
 
@@ -142,60 +137,70 @@ int main(int argc, char **argv) {
     }
 
     /* Write a single byte to the ring */
+    printf("TEST 1: Write single byte to ring\n");
     section = get_producer_section(&ring, ring_len, 1);
     if (section.start != -1) {
         ring.buf[section.start] = *((char *) pkt);
         ring_produce(&ring, ring_len, section);
     } else {
-        printf("Section single byte is invalid where it shouldn't be");
+        *error_msg = "Section single byte is invalid where it shouldn't be.";
+        goto error;
     }
+    printf("PASS\n");
 
     /* See if we have enough to read the header to evaluate the whole read */
+    printf("TEST 2: Attempt to read packet with incomplete header\n");
     section = get_consumer_section(&ring, ring_len, sizeof(int));
-    if(section.start == -1)
-        printf("Coud not read header, I don't know how many bytes I need to read (start=%d, len=%d, wrap=%d)\n",
-                section.start, section.len, section.wrap);
-    else {
-        printf("FAILED, Header returned without having been written");
-        goto cleanup;
+
+    if(section.start != -1) {
+        *error_msg = "Header returned without having been written.";
+        goto error;
     }
+    printf("PASS\n");
 
     /* Copy half the packet in */
+    printf("TEST 3: Copy complete header and half the packet\n");
     section = get_producer_section(&ring, ring_len, 49);
     if (section.start != -1) {
         memcpy(ring.buf + section.start, ((char*) pkt)+1, 49);
         ring_produce(&ring, ring_len, section);
     } else {
-        printf("Section is invalid where it shouldn't be");
+        *error_msg = "Section is invalid where it shouldn't be.";
+        goto error;
     }
+    printf("PASS\n");
 
     /* See if we have enough to read the header to evaluate the whole read */
+    printf("TEST 4: Attempt to read whole packet with full header but incomplete packet\n");
     section = get_consumer_section(&ring, ring_len, sizeof(int));
     if(section.start != -1) {
         int read_len;
         memcpy(&read_len, ring.buf + section.start, sizeof(int));
         section = get_consumer_section(&ring, ring_len, read_len);
-        if(section.start == -1) {
-            printf("Read header, cannot read entire packet of %d bytes. Not consuming header\n", read_len);
-        } else {
-            printf("FAILED, entire packet can be read before it was written ring_len=%d, read_len=%d, start=%d, len=%d, wrap=%d\n",
-                    ring_len, read_len, section.start, section.len, section.wrap);
-            goto cleanup;
+
+        if (section.start != -1) {
+            *error_msg = "Entire packet can be read before it was written.";
+            goto error;
         }
     } else {
         printf("Section half packet is invalid where it shouldn't be");
     }
+    printf("PASS\n");
 
     /* Write the rest */
+    printf("TEST 5: Write entire packet.\n");
     section = get_producer_section(&ring, ring_len, 50);
     if (section.start != -1) {
         memcpy(ring.buf + 50, ((char*) pkt)+50, 50);
         ring_produce(&ring, ring_len, section);
     } else {
-        printf("Section is valid where it shouldn't be");
+        *error_msg = "Section is valid where it shouldn't be.";
+        goto error;
     }
+    printf("PASS\n");
 
     /* See if we have enough to read the header to evaluate the whole read */
+    printf("TEST 6: Try to read entire packet with sufficient data\n");
     section = get_consumer_section(&ring, ring_len, sizeof(int));
     if(section.start != -1) {
         int read_len;
@@ -206,74 +211,27 @@ int main(int argc, char **argv) {
             if (section.len != -1) {
                 ring_consume(&ring, ring_len, section);
             } else {
-                printf("FAILED, Could not read while packet when it should exist in buffer");
-                goto cleanup;
+                *error_msg = "Could not read whole packet when it should exist in buffer.";
+                goto error;
             }
         } else {
-            printf("FAILED, Could not read header when it should exist in buffer start=%d, len=%d, wrap=%d",
-                    section.start, section.len, section.wrap);
-            goto cleanup;
+            *error_msg = "Could not read header when it should exist in buffer.";
+            goto error;
         }
     } else {
-        printf("Section is invalid where it shouldn't be");
+        *error_msg = "Invalid section.";
+        goto error;
+    }
+    printf("PASS\n");
+
+error:
+    if (error_msg) {
+        printf("FAIL: %s\n", *error_msg);
+        printf("Exiting.\n");
     }
 
-cleanup:
     free(ring.buf);
     free(pkt);
 
     return 0;
-}
-
-void hex_dump (const char * desc, const void * addr, const int len) {
-    int i;
-    unsigned char buff[17];
-    const unsigned char * pc = (const unsigned char *)addr;
-
-    // Output description if given.
-
-    if (desc != NULL)
-        printf ("%s:\n", desc);
-
-    // Length checks.
-    if (len == 0) {
-        printf("  ZERO LENGTH\n");
-        return;
-    }
-    else if (len < 0) {
-        printf("  NEGATIVE LENGTH: %d\n", len);
-        return;
-    }
-
-    // Process every byte in the data.
-    for (i = 0; i < len; i++) {
-        // Multiple of 16 means new line (with line offset).
-        if ((i % 16) == 0) {
-            // Don't print ASCII buffer for the "zeroth" line.
-            if (i != 0)
-                printf ("  %s\n", buff);
-
-            // Output the offset.
-            printf ("  %04x ", i);
-        }
-
-        // Now the hex code for the specific character.
-        printf (" %02x", pc[i]);
-
-        // And buffer a printable ASCII character for later.
-        if ((pc[i] < 0x20) || (pc[i] > 0x7e)) // isprint() may be better.
-            buff[i % 16] = '.';
-        else
-            buff[i % 16] = pc[i];
-        buff[(i % 16) + 1] = '\0';
-    }
-
-    // Pad out last line if not exactly 16 characters.
-    while ((i % 16) != 0) {
-        printf ("   ");
-        i++;
-    }
-
-    // And print the final ASCII buffer.
-    printf ("  %s\n", buff);
 }
